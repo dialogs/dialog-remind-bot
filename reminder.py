@@ -8,6 +8,8 @@ from config import *
 import requests
 from datetime import datetime, timedelta
 import re
+from time import sleep
+import pytz
 
 import base64
 
@@ -33,7 +35,7 @@ class Tables(Enum):
     EVENTS = 'events'
 
 
-class PollStrategy(Strategy):
+class RemindStrategy(Strategy):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -44,7 +46,23 @@ class PollStrategy(Strategy):
     def check_code(self, ret):
         if ret.status_code != 200:
             logging.error('error:' + str(ret.status_code) + str(ret.content))
-            exit(1)    
+            return ''   
+        
+    def get_asm_data(self, file=None, task_id=None):
+        if file:
+            return {
+                'apikey': APIKEY,          # (str or None)
+                'model': MODEL,            # (str)
+                'wav': file,  
+                'vad_model': VAD,          # (None or str) default: None
+                'async': True,             # (bool) default: False
+                 'nbest': 1,              # (int) default in model config: 3
+            }
+        else:
+            return {
+                'apikey': APIKEY,
+                'task_id': task_id
+            }      
         
     def text_from_voice(self, uid, file_id, access_hash):
         try:
@@ -54,27 +72,32 @@ class PollStrategy(Strategy):
             doc = requests.get(url)
             wav_base64 = base64.b64encode(doc.content).decode()
             url = 'http://{}/file'.format(ADDRESS)
-            data = {
-                'apikey': APIKEY,          # (str or None)
-                'model': MODEL,            # (str)
-                'wav': wav_base64,         # (bytes)
-                'vad_model': VAD,          # (None or str) default: None
-                 'async': False,           # (bool) default: False
-                'nbest' : 1,
-            }
+            data = self.get_asm_data(file=wav_base64)
             r = requests.post(url, json=data)
-            if r.status_code != 200:
-                logging.error('error:' + str(ret.status_code) + str(ret.content))
+            if self.check_code(r):
+                return ''
+            task_id = r.json()
+            url = 'http://{}/task/status'.format(ADDRESS)
+            data = self.get_asm_data(task_id=task_id)            
+            while True:
+                r = requests.post(url, json=data)
+                if self.check_code(r):
+                    return ''
+                ret = r.json()
+                if ret['done'] == True:
+                    break
+                sleep(1)                
+            url = 'http://{}/task/result'.format(ADDRESS)
+            r = requests.post(url, json=data)
+            if self.check_code(r):
                 return ''
             ret = r.json()
-            res = ret[0]
-            if res['speech']:
-                text = res['speec_info']['text']
-                print(text)
-                return text
-            else:
-                print(res)
-                return ''
+            for res in ret:
+                speech = res['speec_info']
+                if 'text' in speech:
+                    text = speech['text']
+                    return text
+            return ''
         except Exception as e:
             logger.exception(e)
             return ''
@@ -183,11 +206,16 @@ class PollStrategy(Strategy):
         
     def get_tz(self, uid):
         tz = self.bot.users.get_full_profile_by_id(uid).wait().time_zone
-        t = datetime.strptime(tz[1:], "%H:%M")
+        if not re.compile(r'^[+-][0-9][0-9][: ][0-6][0-9]$').search(tz):
+            utc_now = pytz.utc.localize(datetime.utcnow())
+            tz = utc_now.astimezone(pytz.timezone(tz)).strftime('%z')
+        if ':' in tz:
+            tz = tz.replace(':', '')
+        t = datetime.strptime(tz[1:], "%H%M")
         tdelta = timedelta(hours=t.hour, minutes=t.minute)
         if tz[0] == '-':
             return -tdelta
-        return tdelta     
+        return tdelta 
         
     def find_time(self, text):
         time_prep = 'в '
@@ -299,7 +327,7 @@ if __name__ == '__main__':
     while True:
         try:
             logger.info('Start')
-            strategy = PollStrategy(token=BOT_TOKEN,
+            strategy = RemindStrategy(token=BOT_TOKEN,
                                            endpoint=BOT_ENDPOINT,async_=True)
             strategy.start()
         except Exception as e:
